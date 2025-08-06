@@ -10,6 +10,10 @@ import json
 from datetime import datetime, timezone
 import uuid
 from contextlib import asynccontextmanager
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Import the emergentintegrations library
 from emergentintegrations.llm.openai import OpenAIChatRealtime
