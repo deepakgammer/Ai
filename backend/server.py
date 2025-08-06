@@ -22,9 +22,10 @@ db = client.ai_assistant
 # Initialize OpenAI Chat Realtime
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
 if not OPENAI_API_KEY:
-    raise ValueError("OPENAI_API_KEY environment variable is required")
-
-chat = OpenAIChatRealtime(api_key=OPENAI_API_KEY)
+    print("Warning: OPENAI_API_KEY not found, voice features will be disabled")
+    chat = None
+else:
+    chat = OpenAIChatRealtime(api_key=OPENAI_API_KEY)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
