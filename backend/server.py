@@ -93,8 +93,11 @@ class UserMemory(BaseModel):
 
 # Register OpenAI Realtime router
 router = APIRouter()
-OpenAIChatRealtime.register_openai_realtime_router(router, chat)
-app.include_router(router, prefix="/api/v1")
+if chat:
+    OpenAIChatRealtime.register_openai_realtime_router(router, chat)
+    app.include_router(router, prefix="/api/v1")
+else:
+    print("OpenAI realtime router not registered - API key missing")
 
 # Memory and conversation endpoints
 @app.post("/api/conversations")
