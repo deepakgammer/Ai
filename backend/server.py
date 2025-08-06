@@ -1,75 +1,273 @@
-from fastapi import FastAPI, APIRouter
-from dotenv import load_dotenv
-from starlette.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi import APIRouter
 from motor.motor_asyncio import AsyncIOMotorClient
+from pydantic import BaseModel
+from typing import List, Optional, Dict, Any
 import os
-import logging
-from pathlib import Path
-from pydantic import BaseModel, Field
-from typing import List
+import json
+from datetime import datetime, timezone
 import uuid
-from datetime import datetime
+from contextlib import asynccontextmanager
 
+# Import the emergentintegrations library
+from emergentintegrations.llm.openai import OpenAIChatRealtime
 
-ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
+# Database connection
+MONGO_URL = os.environ.get('MONGO_URL', 'mongodb://localhost:27017')
+client = AsyncIOMotorClient(MONGO_URL)
+db = client.ai_assistant
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+# Initialize OpenAI Chat Realtime
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY environment variable is required")
 
-# Create the main app without a prefix
-app = FastAPI()
+chat = OpenAIChatRealtime(api_key=OPENAI_API_KEY)
 
-# Create a router with the /api prefix
-api_router = APIRouter(prefix="/api")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    print("Starting AI Voice Assistant...")
+    yield
+    # Shutdown
+    print("Shutting down AI Voice Assistant...")
 
+# Initialize FastAPI app
+app = FastAPI(
+    title="AI Voice Assistant for Unity Development",
+    description="Personal AI assistant with strong memory for game development",
+    version="1.0.0",
+    lifespan=lifespan
+)
 
-# Define Models
-class StatusCheck(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    client_name: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
-
-class StatusCheckCreate(BaseModel):
-    client_name: str
-
-# Add your routes to the router instead of directly to app
-@api_router.get("/")
-async def root():
-    return {"message": "Hello World"}
-
-@api_router.post("/status", response_model=StatusCheck)
-async def create_status_check(input: StatusCheckCreate):
-    status_dict = input.dict()
-    status_obj = StatusCheck(**status_dict)
-    _ = await db.status_checks.insert_one(status_obj.dict())
-    return status_obj
-
-@api_router.get("/status", response_model=List[StatusCheck])
-async def get_status_checks():
-    status_checks = await db.status_checks.find().to_list(1000)
-    return [StatusCheck(**status_check) for status_check in status_checks]
-
-# Include the router in the main app
-app.include_router(api_router)
-
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_credentials=True,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# Pydantic models
+class ConversationMessage(BaseModel):
+    id: str
+    user_id: str
+    message: str
+    response: str
+    timestamp: datetime
+    context: Optional[Dict[str, Any]] = None
 
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
+class UnityProject(BaseModel):
+    id: str
+    user_id: str
+    name: str
+    description: str
+    created_at: datetime
+    last_modified: datetime
+    scripts: List[Dict[str, Any]] = []
+    status: str = "active"
+
+class Task(BaseModel):
+    id: str
+    user_id: str
+    title: str
+    description: str
+    priority: str = "medium"
+    status: str = "pending"
+    created_at: datetime
+    due_date: Optional[datetime] = None
+    project_id: Optional[str] = None
+
+class UserMemory(BaseModel):
+    id: str
+    user_id: str
+    key: str
+    value: Any
+    category: str
+    created_at: datetime
+    updated_at: datetime
+
+# Register OpenAI Realtime router
+router = APIRouter()
+OpenAIChatRealtime.register_openai_realtime_router(router, chat)
+app.include_router(router, prefix="/api/v1")
+
+# Memory and conversation endpoints
+@app.post("/api/conversations")
+async def save_conversation(conversation: ConversationMessage):
+    """Save a conversation to memory"""
+    try:
+        conversation_dict = conversation.dict()
+        await db.conversations.insert_one(conversation_dict)
+        return {"status": "success", "message": "Conversation saved"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/conversations/{user_id}")
+async def get_conversations(user_id: str, limit: int = 50):
+    """Get recent conversations for context"""
+    try:
+        conversations = await db.conversations.find(
+            {"user_id": user_id}
+        ).sort("timestamp", -1).limit(limit).to_list(limit)
+        return conversations
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Unity project management
+@app.post("/api/projects")
+async def create_project(project: UnityProject):
+    """Create a new Unity project entry"""
+    try:
+        project_dict = project.dict()
+        await db.projects.insert_one(project_dict)
+        return {"status": "success", "project": project_dict}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/projects/{user_id}")
+async def get_projects(user_id: str):
+    """Get all projects for a user"""
+    try:
+        projects = await db.projects.find({"user_id": user_id}).to_list(100)
+        return projects
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/api/projects/{project_id}")
+async def update_project(project_id: str, update_data: Dict[str, Any]):
+    """Update project details"""
+    try:
+        update_data["last_modified"] = datetime.now(timezone.utc)
+        result = await db.projects.update_one(
+            {"id": project_id},
+            {"$set": update_data}
+        )
+        if result.modified_count == 0:
+            raise HTTPException(status_code=404, detail="Project not found")
+        return {"status": "success", "message": "Project updated"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Task management
+@app.post("/api/tasks")
+async def create_task(task: Task):
+    """Create a new task"""
+    try:
+        task_dict = task.dict()
+        await db.tasks.insert_one(task_dict)
+        return {"status": "success", "task": task_dict}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/tasks/{user_id}")
+async def get_tasks(user_id: str, status: Optional[str] = None):
+    """Get tasks for a user, optionally filtered by status"""
+    try:
+        filter_dict = {"user_id": user_id}
+        if status:
+            filter_dict["status"] = status
+        tasks = await db.tasks.find(filter_dict).sort("created_at", -1).to_list(100)
+        return tasks
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/api/tasks/{task_id}")
+async def update_task(task_id: str, update_data: Dict[str, Any]):
+    """Update task status or details"""
+    try:
+        result = await db.tasks.update_one(
+            {"id": task_id},
+            {"$set": update_data}
+        )
+        if result.modified_count == 0:
+            raise HTTPException(status_code=404, detail="Task not found")
+        return {"status": "success", "message": "Task updated"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# User memory system
+@app.post("/api/memory")
+async def save_memory(memory: UserMemory):
+    """Save user memory/preferences"""
+    try:
+        memory_dict = memory.dict()
+        # Upsert based on user_id, key, and category
+        await db.user_memory.update_one(
+            {
+                "user_id": memory.user_id,
+                "key": memory.key,
+                "category": memory.category
+            },
+            {"$set": memory_dict},
+            upsert=True
+        )
+        return {"status": "success", "message": "Memory saved"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/memory/{user_id}")
+async def get_memory(user_id: str, category: Optional[str] = None):
+    """Get user memory/preferences"""
+    try:
+        filter_dict = {"user_id": user_id}
+        if category:
+            filter_dict["category"] = category
+        memories = await db.user_memory.find(filter_dict).to_list(100)
+        return memories
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Unity-specific endpoints
+@app.post("/api/generate-script")
+async def generate_unity_script(request: Dict[str, Any]):
+    """Generate Unity C# script based on requirements"""
+    try:
+        user_id = request.get("user_id")
+        script_type = request.get("script_type")
+        description = request.get("description")
+        
+        # Get user's coding preferences from memory
+        preferences = await db.user_memory.find({
+            "user_id": user_id,
+            "category": "coding_preferences"
+        }).to_list(10)
+        
+        # Here you would typically call the AI to generate the script
+        # For now, return a template response
+        script_template = f"""using UnityEngine;
+
+public class {script_type} : MonoBehaviour
+{{
+    // {description}
+    
+    void Start()
+    {{
+        // Initialization code here
+    }}
+    
+    void Update()
+    {{
+        // Update logic here
+    }}
+}}"""
+        
+        return {
+            "status": "success",
+            "script": script_template,
+            "generated_at": datetime.now(timezone.utc).isoformat()
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/health")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy", "service": "AI Voice Assistant"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8001)
